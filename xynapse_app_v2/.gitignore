@@ -1,0 +1,4 @@
+text_embeddings.pt
+uploads/
+__pycache__/
+*.pyc

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Xynapse — Model Comparison</title>
+    <meta name="description" content="Compare Xynapse OLD vs NEW chest X-ray classification models side by side">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header" id="app-header">
+            <div class="header-left">
+                <div class="logo-mark">
+                    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                        <rect width="32" height="32" rx="8" fill="url(#logo-grad)"/>
+                        <path d="M8 16L14 10L20 16L14 22L8 16Z" fill="white" fill-opacity="0.9"/>
+                        <path d="M14 16L20 10L26 16L20 22L14 16Z" fill="white" fill-opacity="0.5"/>
+                        <defs>
+                            <linearGradient id="logo-grad" x1="0" y1="0" x2="32" y2="32">
+                                <stop stop-color="#6366f1"/>
+                                <stop offset="1" stop-color="#a855f7"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <div class="header-text">
+                    <h1>Xynapse</h1>
+                    <span class="header-subtitle">Model Comparison Tool</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="device-badge" id="device-badge">
+                    <span class="device-dot"></span>
+                    <span>Detecting...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Input Section -->
+        <section class="input-section" id="input-section">
+            <div class="input-grid">
+                <!-- Image Upload -->
+                <div class="input-card" id="upload-card">
+                    <div class="card-header">
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <path d="M17 13V15C17 16.1046 16.1046 17 15 17H5C3.89543 17 3 16.1046 3 15V13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                            <path d="M10 3V12M10 3L7 6M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <span>Chest X-Ray Image</span>
+                    </div>
+                    <div class="upload-zone" id="upload-zone">
+                        <input type="file" id="file-input" accept="image/*" hidden>
+                        <div class="upload-content" id="upload-content">
+                            <div class="upload-icon">
+                                <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                                    <rect x="4" y="8" width="40" height="32" rx="4" stroke="currentColor" stroke-width="2" stroke-dasharray="4 4" fill="none"/>
+                                    <circle cx="16" cy="20" r="3" stroke="currentColor" stroke-width="2" fill="none"/>
+                                    <path d="M4 32L14 24L22 30L32 20L44 32" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                                </svg>
+                            </div>
+                            <p class="upload-text">Drag & drop or <span class="upload-link">browse files</span></p>
+                            <p class="upload-hint">PNG, JPEG, DICOM — any chest X-ray</p>
+                        </div>
+                        <div class="upload-preview" id="upload-preview" hidden>
+                            <img id="preview-img" alt="Uploaded X-ray preview">
+                            <button class="remove-btn" id="remove-btn" title="Remove image">
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                                    <path d="M4 4L12 12M12 4L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                                </svg>
+                            </button>
+                            <div class="file-name" id="file-name"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Report Text -->
+                <div class="input-card" id="report-card">
+                    <div class="card-header">
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <path d="M4 5H16M4 8H12M4 11H14M4 14H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                        <span>Radiology Report</span>
+                        <span class="optional-badge">Optional</span>
+                    </div>
+                    <div class="textarea-wrapper">
+                        <textarea
+                            id="report-text"
+                            placeholder="Enter radiology report text here...&#10;&#10;e.g. &quot;The cardiac silhouette is mildly enlarged. There is a small left-sided pleural effusion. No pneumothorax is identified.&quot;"
+                            rows="8"
+                        ></textarea>
+                        <div class="char-count" id="char-count">0 characters</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Run Button -->
+            <div class="run-section">
+                <button class="run-btn" id="run-btn" disabled>
+                    <span class="run-btn-content">
+                        <svg class="run-icon" width="20" height="20" viewBox="0 0 20 20" fill="none">
+                            <path d="M6 4L16 10L6 16V4Z" fill="currentColor"/>
+                        </svg>
+                        <span>Run Both Models</span>
+                    </span>
+                    <span class="run-btn-loading" hidden>
+                        <div class="spinner"></div>
+                        <span>Running inference...</span>
+                    </span>
+                </button>
+                <p class="run-hint">Both models will run simultaneously for comparison</p>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section class="results-section" id="results-section" hidden>
+            <!-- Results Header -->
+            <div class="results-header" id="results-header">
+                <h2>Comparison Results</h2>
+                <div class="results-meta">
+                    <span class="results-mode" id="results-mode"></span>
+                    <span class="results-sep">·</span>
+                    <span class="results-device" id="results-device"></span>
+                </div>
+            </div>
+
+            <!-- Side-by-side results -->
+            <div class="comparison-grid">
+                <!-- NEW MODEL -->
+                <div class="model-panel model-new" id="panel-new">
+                    <div class="panel-header">
+                        <div class="panel-badge badge-new">NEW</div>
+                        <div class="panel-title">
+                            <h3>Xynapse Best</h3>
+                            <span class="panel-file">xynapse_best.pt</span>
+                        </div>
+                        <div class="panel-time" id="time-new">—</div>
+                    </div>
+                    <div class="panel-body">
+                        <!-- Probability bars -->
+                        <div class="prob-bars" id="probs-new"></div>
+                        <!-- Detected summary -->
+                        <div class="detected-summary" id="detected-new"></div>
+                        <!-- Threshold info -->
+                        <div class="threshold-info" id="thresholds-new"></div>
+                    </div>
+                </div>
+
+                <!-- OLD MODEL -->
+                <div class="model-panel model-old" id="panel-old">
+                    <div class="panel-header">
+                        <div class="panel-badge badge-old">OLD</div>
+                        <div class="panel-title">
+                            <h3>Xynapse Old</h3>
+                            <span class="panel-file">xynapse_old.pt</span>
+                        </div>
+                        <div class="panel-time" id="time-old">—</div>
+                    </div>
+                    <div class="panel-body">
+                        <div class="prob-bars" id="probs-old"></div>
+                        <div class="detected-summary" id="detected-old"></div>
+                        <div class="threshold-info" id="thresholds-old"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Diff Table -->
+            <div class="diff-section" id="diff-section">
+                <div class="diff-header">
+                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                        <path d="M4 10H16M10 4V16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                    <h3>Probability Differences</h3>
+                </div>
+                <div class="diff-table-wrap">
+                    <table class="diff-table" id="diff-table">
+                        <thead>
+                            <tr>
+                                <th>Pathology</th>
+                                <th>NEW Prob</th>
+                                <th>OLD Prob</th>
+                                <th>Δ Diff</th>
+                                <th>NEW Pred</th>
+                                <th>OLD Pred</th>
+                                <th>Agreement</th>
+                            </tr>
+                        </thead>
+                        <tbody id="diff-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Terminal Logs -->
+            <div class="logs-section">
+                <div class="logs-grid">
+                    <div class="log-panel" id="log-panel-new">
+                        <div class="log-header">
+                            <div class="terminal-dots">
+                                <span class="dot dot-red"></span>
+                                <span class="dot dot-yellow"></span>
+                                <span class="dot dot-green"></span>
+                            </div>
+                            <span class="log-title">NEW Model Log</span>
+                        </div>
+                        <pre class="log-content" id="log-new"></pre>
+                    </div>
+                    <div class="log-panel" id="log-panel-old">
+                        <div class="log-header">
+                            <div class="terminal-dots">
+                                <span class="dot dot-red"></span>
+                                <span class="dot dot-yellow"></span>
+                                <span class="dot dot-green"></span>
+                            </div>
+                            <span class="log-title">OLD Model Log</span>
+                        </div>
+                        <pre class="log-content" id="log-old"></pre>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Error Display -->
+        <div class="error-toast" id="error-toast" hidden>
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                <circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <path d="M10 6V11M10 13.5V14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+            <span id="error-msg"></span>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,384 @@
+"""
+Xynapse REST API Server
+────────────────────────────────────────────────────────────────
+A Flask REST API for chest X-ray classification using the Xynapse
+multimodal fusion model. Designed to be deployed on Railway and
+called from a separate React frontend hosted on Cloudflare Pages.
+
+Usage:
+    python app.py
+    → listens on 0.0.0.0:${PORT:-5000}
+"""
+
+import os
+import sys
+import uuid
+import time
+from io import StringIO
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+import torchxrayvision as xrv
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+TARGET_LABELS = ["Cardiomegaly", "Pleural Effusion", "Pneumonia", "Pneumothorax", "Consolidation"]
+IMG_SIZE = 224
+BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
+
+# Thresholds — optimised on the validation set WITH real text embeddings (multimodal)
+THRESHOLDS_NEW = {
+    "Cardiomegaly":     0.46,
+    "Pleural Effusion": 0.83,
+    "Pneumonia":        0.84,
+    "Pneumothorax":     0.75,
+    "Consolidation":    0.75,
+}
+
+# Thresholds for IMAGE-ONLY mode (zero text embedding).
+# The model's output distribution shifts lower without a real report, so we
+# use reduced thresholds (~0.85× of the multimodal values, minimum 0.40).
+THRESHOLDS_NEW_IMAGE_ONLY = {
+    "Cardiomegaly":     0.40,   # 0.46 → 0.40
+    "Pleural Effusion": 0.70,   # 0.83 → 0.70
+    "Pneumonia":        0.72,   # 0.84 → 0.72
+    "Pneumothorax":     0.64,   # 0.75 → 0.64
+    "Consolidation":    0.64,   # 0.75 → 0.64
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Model Definitions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ImageEncoderNew(nn.Module):
+    def __init__(self, out_dim=256, freeze_backbone=True):
+        super().__init__()
+        self.backbone = xrv.models.DenseNet(weights="densenet121-res224-all")
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+        self.proj = nn.Sequential(
+            nn.Linear(1024, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(),
+        )
+
+    def unfreeze_top_block(self):
+        for name, p in self.backbone.named_parameters():
+            if "denseblock4" in name or "norm5" in name:
+                p.requires_grad = True
+
+    def forward(self, x):
+        feats = self.backbone.features(x)
+        feats = F.adaptive_avg_pool2d(feats, 1).flatten(1)
+        return self.proj(feats)
+
+
+class TextProjection(nn.Module):
+    def __init__(self, in_dim=768, out_dim=256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, txt_emb):
+        return self.proj(txt_emb)
+
+
+class GatedFusion(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = nn.Sequential(nn.Linear(dim * 2, dim), nn.Sigmoid())
+
+    def forward(self, img, txt):
+        cat   = torch.cat([img, txt], dim=1)
+        alpha = self.gate(cat)
+        gated = alpha * img + (1 - alpha) * txt
+        return torch.cat([gated, img, txt], dim=1)
+
+
+class FusionModelNew(nn.Module):
+    """New model — has aux_head, returns (logits, aux_logits)."""
+    def __init__(self, img_dim=256, txt_dim=768, proj_dim=256, num_labels=5):
+        super().__init__()
+        self.image_enc = ImageEncoderNew(out_dim=proj_dim)
+        self.text_proj = TextProjection(in_dim=txt_dim, out_dim=proj_dim)
+        self.fusion    = GatedFusion(dim=proj_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(proj_dim * 3, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, num_labels),
+        )
+        self.aux_head = nn.Sequential(
+            nn.Linear(proj_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_labels),
+        )
+
+    def forward(self, images, txt_emb):
+        img_feat = self.image_enc(images)
+        txt_feat = self.text_proj(txt_emb)
+        fused    = self.fusion(img_feat, txt_feat)
+        logits     = self.mlp(fused)
+        aux_logits = self.aux_head(img_feat)
+        return logits, aux_logits
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Global model — loaded ONCE at startup, reused across all requests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_fusion_model: FusionModelNew = None  # populated in load_model_at_startup()
+
+
+def load_model_at_startup():
+    """Load FusionModelNew from disk once at server startup."""
+    global _fusion_model
+    weights_path = os.path.join(BASE_DIR, "xynapse_best.pt")
+    print(f"[startup] Loading FusionModelNew from {weights_path} on {DEVICE}...")
+    model = FusionModelNew().to(DEVICE)
+    state = torch.load(weights_path, map_location=DEVICE, weights_only=True)
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    _fusion_model = model
+    print("[startup] Model loaded successfully.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Preprocessing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+val_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+])
+
+def load_image(path: str) -> torch.Tensor:
+    """Load a chest X-ray PNG/JPEG → (1, 1, 224, 224) in torchxrayvision range."""
+    img = Image.open(path).convert("L")
+    t   = val_transform(img)         # (1, 224, 224) in [0, 1]
+    t   = t * 2048 - 1024            # torchxrayvision normalisation
+    return t.unsqueeze(0)            # (1, 1, 224, 224)
+
+
+def embed_text(text: str, device: str = "cpu") -> torch.Tensor:
+    """Embed a single report string with ClinicalBERT → (1, 768)."""
+    from transformers import AutoTokenizer, AutoModel
+    print("  Loading ClinicalBERT (first call only)...")
+    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
+    bert      = AutoModel.from_pretrained(BERT_MODEL).to(device).eval()
+    with torch.no_grad():
+        enc = tokenizer(text, return_tensors="pt", truncation=True,
+                        max_length=128, padding=True).to(device)
+        out = bert(**enc)
+        emb = out.last_hidden_state[:, 0, :].cpu()   # (1, 768)
+    del bert
+    torch.cuda.empty_cache()
+    return emb
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Text embedding — resolve ONCE, shared by both models
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def resolve_text_embedding(report_text, device):
+    """
+    Resolve the text embedding for the report, checking the cache first.
+    Returns (txt_emb, modality, embed_log) where txt_emb is a (1, 768) tensor.
+    """
+    log_lines = []
+
+    if not report_text.strip():
+        log_lines.append("No report text — using image-only mode (zero embedding).")
+        return torch.zeros(1, 768), "image_only", "\n".join(log_lines)
+
+    cache_key = report_text.strip()
+
+    # Check embedding cache — always use the canonical path
+    cache_path = os.path.join(BASE_DIR, "text_embeddings.pt")
+    if os.path.exists(cache_path):
+        cache = torch.load(cache_path, weights_only=False)
+        txt_emb = cache.get(cache_key, None)
+        if txt_emb is not None:
+            log_lines.append("Text embedding found in cache (text_embeddings.pt).")
+            return txt_emb, "multimodal", "\n".join(log_lines)
+
+    # Not in cache — embed with ClinicalBERT
+    log_lines.append("Report not in cache — embedding with ClinicalBERT...")
+    txt_emb = embed_text(report_text, device)
+    log_lines.append("Text embedded successfully.")
+
+    # Save to cache (load existing entries first to avoid overwriting them)
+    cache = {}
+    if os.path.exists(cache_path):
+        cache = torch.load(cache_path, weights_only=False)
+    cache[cache_key] = txt_emb
+    torch.save(cache, cache_path)  # fixed: was referencing undefined old_cache_path
+    log_lines.append("Saved embedding to cache.")
+
+    return txt_emb, "multimodal", "\n".join(log_lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inference runner — uses the globally loaded model
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_new_model(image_path, txt_emb, modality, device):
+    """Run inference with the globally loaded NEW model. Returns (result_dict, log_str, elapsed)."""
+    log = StringIO()
+    _print = lambda *a, **kw: print(*a, **kw, file=log)
+
+    t0 = time.time()
+    # Select threshold set based on modality
+    thresholds = THRESHOLDS_NEW_IMAGE_ONLY if modality == "image_only" else THRESHOLDS_NEW
+
+    _print(f"[NEW] Using pre-loaded model on {device}...")
+
+    img = load_image(image_path).to(device)
+    _print(f"[NEW] Image loaded: {os.path.basename(image_path)}")
+    _print(f"[NEW] Modality: {modality}")
+
+    txt_emb = txt_emb.to(device)
+
+    _print(f"[NEW] Running forward pass...")
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
+            logits, aux_logits = _fusion_model(img, txt_emb)
+        probs = torch.sigmoid(logits).squeeze(0).cpu().numpy()
+
+    prob_dict = {label: round(float(probs[i]), 4) for i, label in enumerate(TARGET_LABELS)}
+    pred_dict = {label: int(probs[i] >= thresholds[label]) for i, label in enumerate(TARGET_LABELS)}
+    detected  = [label for label in TARGET_LABELS if pred_dict[label] == 1]
+
+    elapsed = time.time() - t0
+
+    threshold_note = " (image-only thresholds)" if modality == "image_only" else ""
+    _print(f"\n{'═'*52}")
+    _print(f"  Xynapse NEW — {os.path.basename(image_path)}")
+    _print(f"  Mode: {modality}{threshold_note}")
+    _print(f"{'═'*52}")
+    for label in TARGET_LABELS:
+        p   = prob_dict[label]
+        pos = pred_dict[label]
+        thr = thresholds[label]
+        bar = "█" * int(p * 20) + "░" * (20 - int(p * 20))
+        status = "✓ POSITIVE" if pos else "  negative"
+        _print(f"  {label:<20} {bar}  {p:.2f}  [thr={thr:.2f}]  {status}")
+    _print(f"{'─'*52}")
+    if detected:
+        _print(f"  Detected: {', '.join(detected)}")
+    else:
+        _print("  No acute findings detected.")
+    _print(f"{'═'*52}")
+    _print(f"\n[NEW] Inference completed in {elapsed:.2f}s")
+
+    return {
+        "probs": prob_dict,
+        "predictions": pred_dict,
+        "detected": detected,
+        "modality": modality,
+        "thresholds": thresholds,
+    }, log.getvalue(), elapsed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Flask App
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+CORS(app)  # Allow all origins — React frontend on Cloudflare Pages will call this
+
+# Load model at module level so both gunicorn workers and direct `python app.py`
+# runs have the model ready before the first request is served.
+load_model_at_startup()
+
+
+@app.route("/health")
+def health():
+    """Health check endpoint for Railway."""
+    return jsonify({"status": "ok"})
+
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    """Serve uploaded X-ray images (still useful for debugging / preview links)."""
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    # Get image
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+    file = request.files["image"]
+    if file.filename == "":
+        return jsonify({"error": "No image selected"}), 400
+
+    # Save uploaded file
+    ext = os.path.splitext(file.filename)[1] or ".png"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    file.save(filepath)
+
+    report_text = request.form.get("report", "").strip()
+
+    # ── Step 1: Resolve text embedding ONCE ──
+    try:
+        txt_emb, modality, embed_log = resolve_text_embedding(report_text, DEVICE)
+    except Exception as e:
+        embed_log = f"ERROR embedding text: {str(e)}"
+        txt_emb = torch.zeros(1, 768)
+        modality = "image_only"
+
+    # ── Step 2: Run NEW model ──
+    try:
+        new_result, new_log, new_time = run_new_model(filepath, txt_emb, modality, DEVICE)
+        new_log = f"[EMBED] {embed_log}\n\n{new_log}"
+    except Exception as e:
+        new_result = None
+        new_log = f"[EMBED] {embed_log}\n\n[NEW] ERROR: {str(e)}"
+        new_time = 0
+
+    return jsonify({
+        "image_url": f"/uploads/{filename}",
+        "report": report_text,
+        "device": DEVICE,
+        "new_model": {
+            "name": "Xynapse NEW (xynapse_best.pt)",
+            "result": new_result,
+            "log": new_log,
+            "time": round(new_time, 2),
+        },
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    port = int(os.environ.get("PORT", 5000))
+    print("=" * 48)
+    print(f"  Xynapse API — http://0.0.0.0:{port}")
+    print("=" * 48)
+    app.run(host="0.0.0.0", port=port, debug=False)
