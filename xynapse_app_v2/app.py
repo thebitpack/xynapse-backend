@@ -304,7 +304,7 @@ def run_new_model(image_path, txt_emb, modality, device):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
-CORS(app)  # Allow all origins — React frontend on Cloudflare Pages will call this
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins — React frontend on Cloudflare Pages will call this
 
 # Load model at module level so both gunicorn workers and direct `python app.py`
 # runs have the model ready before the first request is served.
