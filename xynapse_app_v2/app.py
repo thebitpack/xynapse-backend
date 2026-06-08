@@ -17,7 +17,7 @@ import time
 from io import StringIO
 
 from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 
 import torch
 import torch.nn as nn
@@ -304,7 +304,14 @@ def run_new_model(image_path, txt_emb, modality, device):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins — React frontend on Cloudflare Pages will call this
+CORS(app)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 # Load model at module level so both gunicorn workers and direct `python app.py`
 # runs have the model ready before the first request is served.
