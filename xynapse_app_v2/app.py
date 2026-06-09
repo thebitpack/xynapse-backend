@@ -26,6 +26,11 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 import torchxrayvision as xrv
+import onnxruntime as ort
+
+# ── CPU thread tuning for faster ONNX inference ──
+torch.set_num_threads(4)
+torch.set_num_interop_threads(4)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -142,24 +147,27 @@ class FusionModelNew(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Global model — loaded ONCE at startup, reused across all requests
+# Global ONNX session — loaded ONCE at startup, reused across all requests
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_fusion_model: FusionModelNew = None  # populated in load_model_at_startup()
+_ort_session: ort.InferenceSession = None  # populated in load_model_at_startup()
 
 
 def load_model_at_startup():
-    """Load FusionModelNew from disk once at server startup."""
-    global _fusion_model
-    weights_path = os.path.join(BASE_DIR, "xynapse_best.pt")
-    print(f"[startup] Loading FusionModelNew from {weights_path} on {DEVICE}...")
-    model = FusionModelNew().to(DEVICE)
-    state = torch.load(weights_path, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(state, strict=False)
-    model.eval()
-    _fusion_model = model
-    print("[startup] Model loaded successfully.")
+    """Load xynapse.onnx via ONNX Runtime once at server startup."""
+    global _ort_session
+    onnx_path = os.path.join(BASE_DIR, "xynapse.onnx")
+    print(f"[startup] Loading ONNX model from {onnx_path}...")
+    sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 4
+    sess_options.inter_op_num_threads = 4
+    _ort_session = ort.InferenceSession(
+        onnx_path,
+        sess_options=sess_options,
+        providers=["CPUExecutionProvider"],
+    )
+    print("[startup] ONNX model loaded successfully.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -250,19 +258,24 @@ def run_new_model(image_path, txt_emb, modality, device):
     # Select threshold set based on modality
     thresholds = THRESHOLDS_NEW_IMAGE_ONLY if modality == "image_only" else THRESHOLDS_NEW
 
-    _print(f"[NEW] Using pre-loaded model on {device}...")
+    _print(f"[NEW] Using ONNX Runtime session (CPUExecutionProvider)...")
 
-    img = load_image(image_path).to(device)
+    img = load_image(image_path)  # (1, 1, 224, 224) tensor
+    img_np = img.numpy().astype(np.float32)
     _print(f"[NEW] Image loaded: {os.path.basename(image_path)}")
     _print(f"[NEW] Modality: {modality}")
 
-    txt_emb = txt_emb.to(device)
+    txt_np = txt_emb.numpy().astype(np.float32)  # (1, 768)
 
-    _print(f"[NEW] Running forward pass...")
-    with torch.no_grad():
-        with torch.amp.autocast(device_type="cuda", enabled=(device == "cuda")):
-            logits, aux_logits = _fusion_model(img, txt_emb)
-        probs = torch.sigmoid(logits).squeeze(0).cpu().numpy()
+    _print(f"[NEW] Running ONNX forward pass...")
+    ort_inputs = {
+        _ort_session.get_inputs()[0].name: img_np,
+        _ort_session.get_inputs()[1].name: txt_np,
+    }
+    ort_outs = _ort_session.run(None, ort_inputs)
+    logits_np = ort_outs[0]  # shape (1, 5) — main logits
+    probs = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
+    probs = probs.squeeze(0)  # (5,)
 
     prob_dict = {label: round(float(probs[i]), 4) for i, label in enumerate(TARGET_LABELS)}
     pred_dict = {label: int(probs[i] >= thresholds[label]) for i, label in enumerate(TARGET_LABELS)}
@@ -313,7 +326,7 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
-# Load model at module level so both gunicorn workers and direct `python app.py`
+# Load model at module level so both waitress and direct `python app.py`
 # runs have the model ready before the first request is served.
 load_model_at_startup()
 
@@ -384,8 +397,7 @@ def api_predict():
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+    from waitress import serve
     port = int(os.environ.get("PORT", 5000))
-    print("=" * 48)
-    print(f"  Xynapse API — http://0.0.0.0:{port}")
-    print("=" * 48)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"Starting Xynapse API on port {port}")
+    serve(app, host="0.0.0.0", port=port, threads=4)

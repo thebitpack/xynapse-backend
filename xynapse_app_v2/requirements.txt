@@ -6,4 +6,5 @@ torchxrayvision>=1.0.1
 transformers>=4.40.0
 Pillow>=10.0.0
 numpy>=1.26.0
-gunicorn>=22.0.0
+waitress
+onnxruntime>=1.17.0
