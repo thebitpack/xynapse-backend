@@ -16,6 +16,13 @@ import uuid
 import time
 from io import StringIO
 
+# Load .env automatically when running locally (no-op if file doesn't exist)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — env vars must be set externally
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS, cross_origin
 
@@ -27,6 +34,7 @@ from PIL import Image
 from torchvision import transforms
 import torchxrayvision as xrv
 import onnxruntime as ort
+import groq
 
 # ── CPU thread tuning for faster ONNX inference ──
 torch.set_num_threads(4)
@@ -41,6 +49,8 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 TARGET_LABELS = ["Cardiomegaly", "Pleural Effusion", "Pneumonia", "Pneumothorax", "Consolidation"]
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 IMG_SIZE = 224
 BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 
@@ -388,6 +398,107 @@ def api_predict():
             "time": round(new_time, 2),
         },
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Medical Chatbot — /api/chat
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """
+    Medical chatbot endpoint backed by Groq (llama-3.1-8b-instant).
+
+    Request JSON:
+        {
+          "message": "string",
+          "history": [{"role": "user"|"assistant", "content": "string"}, ...],
+          "scan": {
+            "detected": ["Pneumonia", ...],
+            "probs": {"Cardiomegaly": 0.72, ...}
+          }
+        }
+
+    Response JSON:
+        { "reply": "string" }
+    """
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY not configured"}), 500
+
+    body = request.get_json(force=True, silent=True) or {}
+    user_message = body.get("message", "").strip()
+    history      = body.get("history", [])
+    scan         = body.get("scan", {})
+
+    if not user_message:
+        return jsonify({"error": "message field is required"}), 400
+
+    # ── Build scan context ──
+    detected = scan.get("detected", [])
+    probs    = scan.get("probs", {})
+
+    detected_str = ", ".join(detected) if detected else "None"
+
+    scores_lines = []
+    for label in TARGET_LABELS:
+        pct = round(probs.get(label, 0.0) * 100, 1)
+        scores_lines.append(f"  - {label}: {pct}%")
+    scores_str = "\n".join(scores_lines)
+
+    # ── Location-first rule (only injected on the very first turn) ──
+    location_rule = ""
+    if len(history) == 0:
+        location_rule = (
+            "IMPORTANT: Before answering ANY question, you MUST first ask the user "
+            "for their city and country. Do not provide any medical information until "
+            "they have supplied their location. Once they do, recommend 3-4 real hospitals "
+            "or health institutes in that city that specifically treat the detected "
+            "condition(s), using your training knowledge only — no external APIs."
+        )
+
+    # ── System prompt ──
+    system_prompt = f"""You are Xynapse's medical assistant — a concise, plain-language AI \
+specialised in chest X-ray findings.
+
+SCAN RESULTS
+============
+Detected conditions : {detected_str}
+Confidence scores   :
+{scores_str}
+
+BEHAVIOUR RULES
+===============
+1. TOPIC RESTRICTION — Only discuss topics directly related to chest X-rays, chest scans, 
+   or the conditions detected above. If the user asks about anything unrelated, politely 
+   decline and redirect them back to their scan results.
+2. CONCISENESS — Keep every reply to 3-5 sentences maximum. Use plain language; avoid 
+   medical jargon. If a term is necessary, briefly explain it.
+3. DISCLAIMER — Every single response MUST end with this exact one-line reminder on its own 
+   line: "⚠️ This is not a substitute for professional diagnosis — please consult a licensed physician."
+{location_rule}"""
+
+    # ── Assemble message list ──
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in history:
+        role    = turn.get("role", "user")
+        content = turn.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_message})
+
+    # ── Call Groq ──
+    try:
+        client = groq.Groq(api_key=GROQ_API_KEY)
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.5,
+            max_tokens=512,
+        )
+        reply = completion.choices[0].message.content.strip()
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
