@@ -445,17 +445,6 @@ def api_chat():
         scores_lines.append(f"  - {label}: {pct}%")
     scores_str = "\n".join(scores_lines)
 
-    # ── Location-first rule (only injected on the very first turn) ──
-    location_rule = ""
-    if len(history) == 0:
-        location_rule = (
-            "IMPORTANT: Before answering ANY question, you MUST first ask the user "
-            "for their city and country. Do not provide any medical information until "
-            "they have supplied their location. Once they do, recommend 3-4 real hospitals "
-            "or health institutes in that city that specifically treat the detected "
-            "condition(s), using your training knowledge only — no external APIs."
-        )
-
     # ── System prompt ──
     system_prompt = f"""You are Xynapse's medical assistant — a concise, plain-language AI \
 specialised in chest X-ray findings.
@@ -468,14 +457,16 @@ Confidence scores   :
 
 BEHAVIOUR RULES
 ===============
-1. TOPIC RESTRICTION — Only discuss topics directly related to chest X-rays, chest scans, 
-   or the conditions detected above. If the user asks about anything unrelated, politely 
-   decline and redirect them back to their scan results.
-2. CONCISENESS — Keep every reply to 3-5 sentences maximum. Use plain language; avoid 
-   medical jargon. If a term is necessary, briefly explain it.
-3. DISCLAIMER — Every single response MUST end with this exact one-line reminder on its own 
-   line: "⚠️ This is not a substitute for professional diagnosis — please consult a licensed physician."
-{location_rule}"""
+1. TOPIC RESTRICTION — Only discuss topics directly related to chest X-rays, chest scans, \
+or the conditions detected above. If the user asks about anything unrelated, politely \
+decline and redirect them back to their scan results.
+2. CONCISENESS — Keep every reply to 3-5 sentences maximum. Use plain language; avoid \
+medical jargon. If a term is necessary, briefly explain it.
+3. DISCLAIMER — Every single response MUST end with this exact one-line reminder on its own \
+line: "⚠️ This is not a substitute for professional diagnosis — please consult a licensed physician."
+4. LOCATION-FIRST REQUIREMENT — Before answering any medical questions or providing clinical details, check the chat history:
+   - If the user has not yet provided their location (city and country), you MUST ask them to provide their city and country, and do not provide any medical/clinical information yet.
+   - Once the user has provided their location (either in the current message or in the history), you MUST recommend 3-4 real, specific hospitals or medical centers in that city/country that treat the detected condition(s), using your training knowledge only (no external APIs)."""
 
     # ── Assemble message list ──
     messages = [{"role": "system", "content": system_prompt}]
